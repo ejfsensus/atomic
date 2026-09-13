@@ -5,26 +5,33 @@ description: Spatial visualization of your knowledge graph using semantic and ta
 
 Canvas is a spatial visualization of your knowledge graph. It gives you a bird's-eye view of atoms, tags, clusters, and semantic relationships.
 
-## Force Simulation
+## Layouts
 
-Atoms are positioned using several forces:
+The default **Islands** layout groups semantic communities into separate visual territories. Atoms retain their relative semantic shape within each island, while the islands themselves are packed apart so related communities can be read independently.
 
-- **Link force** - Atoms sharing tags are linked together.
-- **Similarity force** - Semantically related atoms are pulled closer together.
-- **Charge force** - Repulsion prevents atoms from overlapping.
-- **Center force** - Keeps the graph centered in the viewport.
+Use **Semantic map** when you want the original global PCA projection, where nearby atoms are semantically close across the entire knowledge base.
 
-## Persistent Layout
+In Islands mode, only connections within a community show by default. Turn on **Show bridges** to reveal cross-community relationships.
 
-Atom positions are saved to the database, so the layout is stable across sessions. When you reopen the canvas, atoms stay where you placed them.
+## Clusters and tags
 
-Atomic has both persisted atom positions and computed graph data. The canvas-level APIs can return aggregated nodes when a graph is too large to render atom by atom.
+- **Islands and boundaries** represent semantic clusters.
+- **Node size** reflects graph connectivity.
+- **Node colour** can represent top-level tag categories (Topics, People, Locations, Organizations, Events) or semantic clusters.
+- **Focus** isolates one semantic cluster; choose All clusters to return to the overview.
+- Selecting a tag in the sidebar still highlights matching atoms. On the canvas, **Isolate selected tag** hides unrelated atoms.
+
+## Layout updates
+
+The primary canvas layout is calculated from embeddings and semantic edges, so it updates as the knowledge base changes. Visual preferences such as layout and colour mode are remembered locally.
+
+Atomic also exposes persisted atom-position and hierarchical canvas APIs for clients that need them. The desktop canvas uses the computed graph data so it can reflect new embeddings and semantic edges automatically.
 
 ## Interaction
 
 - **Zoom and pan** - Navigate the graph with mouse or trackpad.
 - **Click** - Select an atom to view its content.
-- **Drag** - Reposition atoms manually.
+- **Hover** - Highlight an atom's direct neighborhood.
 - **Filter** - Scope the canvas to specific tags.
 
 ## Graph APIs

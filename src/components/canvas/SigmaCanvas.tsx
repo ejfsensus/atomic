@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { Loader2 } from 'lucide-react';
 import { useUIStore } from '../../stores/ui';
 import { useDatabasesStore } from '../../stores/databases';
+import { useTagsStore } from '../../stores/tags';
 import { getGlobalCanvas, type GlobalCanvasData } from '../../lib/api';
 import { getTransport } from '../../lib/transport';
 import Graph from 'graphology';
@@ -16,6 +17,8 @@ import {
 } from './sigma/themes';
 import { AtomPreviewPopover } from './AtomPreviewPopover';
 import { useCanvasStore } from '../../stores/canvas';
+import { computeClusterIslandLayout } from './clusterIslands';
+import { buildTagCategoryIndex, categoryColor, categoryForAtom } from './tagCategories';
 
 function truncLabel(str: string, max: number): string {
   return str.length > max ? str.substring(0, max - 1) + '\u2026' : str;
@@ -28,6 +31,13 @@ function parseRgbColor(s: string): [number, number, number] | null {
 }
 
 export type SigmaCanvasMode = 'main' | 'preview';
+type CanvasLayoutMode = 'islands' | 'map';
+type CanvasColorMode = 'category' | 'cluster';
+
+function readCanvasPreference<T extends string>(key: string, fallback: T, values: readonly T[]): T {
+  const stored = localStorage.getItem(key);
+  return values.includes(stored as T) ? stored as T : fallback;
+}
 
 interface SigmaCanvasProps {
   /** 'main' runs the full interactive canvas; 'preview' renders a thumbnail
@@ -63,6 +73,8 @@ export function SigmaCanvas({
   const openReader = useUIStore(s => s.openReader);
   const selectedTagId = useUIStore(s => s.selectedTagId);
   const activeDbId = useDatabasesStore(s => s.activeId);
+  const tags = useTagsStore(s => s.tags);
+  const tagCategoryIndex = useMemo(() => buildTagCategoryIndex(tags), [tags]);
   const containerRef = useRef<HTMLDivElement>(null);
   // The hover pill renders into this div, which lives outside the
   // overflow-hidden Sigma container. That lets long titles spill past the
@@ -77,11 +89,26 @@ export function SigmaCanvas({
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<CanvasTheme>(DEFAULT_THEME);
   const [themePickerOpen, setThemePickerOpen] = useState(false);
+  const [layoutMode, setLayoutMode] = useState<CanvasLayoutMode>(() =>
+    readCanvasPreference('canvas-layout-mode', 'islands', ['islands', 'map']),
+  );
+  const [colorMode, setColorMode] = useState<CanvasColorMode>(() =>
+    readCanvasPreference('canvas-color-mode', 'category', ['category', 'cluster']),
+  );
+  const [focusedClusterId, setFocusedClusterId] = useState<string | null>(null);
+  const [isolateSelectedTag, setIsolateSelectedTag] = useState(false);
+  const [showClusterBridges, setShowClusterBridges] = useState(false);
   const [edgeThreshold, setEdgeThreshold] = useState(0);
   const edgeThresholdRef = useRef(0);
   const edgeAnimProgress = useRef(0); // 0 = invisible, 1 = fully visible
   const themeRef = useRef(theme);
   themeRef.current = theme;
+  const colorModeRef = useRef(colorMode);
+  colorModeRef.current = colorMode;
+  const tagCategoryIndexRef = useRef(tagCategoryIndex);
+  tagCategoryIndexRef.current = tagCategoryIndex;
+  const isolateSelectedTagRef = useRef(isolateSelectedTag);
+  isolateSelectedTagRef.current = isolateSelectedTag;
 
   // Hover emphasis: when a node is hovered, dim everything outside its neighborhood.
   // neighborsRef lets the edge/node reducers answer "is X a neighbor of hovered?" in O(1).
@@ -120,6 +147,7 @@ export function SigmaCanvas({
     let cancelled = false;
     setIsLoading(true);
     setError(null);
+    setFocusedClusterId(null);
 
     getGlobalCanvas()
       .then((result) => {
@@ -156,6 +184,15 @@ export function SigmaCanvas({
     // fits-to-bbox over just those nodes.
     let atoms = data.atoms;
     let edges = data.edges;
+    const visualGroupByAtom = new Map<string, string>();
+    for (const cluster of data.clusters) {
+      for (const atomId of cluster.atom_ids) visualGroupByAtom.set(atomId, cluster.id);
+    }
+    for (const atom of data.atoms) {
+      if (!visualGroupByAtom.has(atom.atom_id)) {
+        visualGroupByAtom.set(atom.atom_id, 'cluster:unclustered');
+      }
+    }
     if (filterAtomIds && filterAtomIds.length > 0) {
       const seeds = new Set(filterAtomIds);
       const included = new Set(seeds);
@@ -165,6 +202,25 @@ export function SigmaCanvas({
       }
       atoms = data.atoms.filter(a => included.has(a.atom_id));
       edges = data.edges.filter(e => included.has(e.source) && included.has(e.target));
+    }
+
+    // Focusing a cluster keeps its members fully interactive while removing
+    // the visual interference of every other community. Unclustered atoms
+    // receive the same treatment through their synthetic island ID.
+    if (!isPreview && focusedClusterId) {
+      const focused = data.clusters.find(cluster => cluster.id === focusedClusterId);
+      const clusteredAtomIds = new Set(data.clusters.flatMap(cluster => cluster.atom_ids));
+      const included = focused
+        ? new Set(focused.atom_ids)
+        : new Set(data.atoms.map(atom => atom.atom_id).filter(id => !clusteredAtomIds.has(id)));
+      atoms = atoms.filter(atom => included.has(atom.atom_id));
+      edges = edges.filter(edge => included.has(edge.source) && included.has(edge.target));
+    }
+    // Islands are a reading view first. Keep relationships inside each
+    // community visible by default; cross-community bridges are available on
+    // demand without turning the overview back into a hairball.
+    if (!isPreview && layoutMode === 'islands' && !showClusterBridges) {
+      edges = edges.filter(edge => visualGroupByAtom.get(edge.source) === visualGroupByAtom.get(edge.target));
     }
     if (atoms.length === 0) return;
 
@@ -176,6 +232,13 @@ export function SigmaCanvas({
     const graph = new Graph();
     graphRef.current = graph;
     const scale = 500;
+    const islandLayout = !isPreview && layoutMode === 'islands'
+      ? computeClusterIslandLayout(data.atoms, data.clusters, scale)
+      : null;
+    const renderedAtomIds = new Set(atoms.map(atom => atom.atom_id));
+    const visibleIslands = islandLayout?.islands.filter(island =>
+      island.atomIds.some(atomId => renderedAtomIds.has(atomId)),
+    ) ?? [];
 
     // Compute per-atom edge count (over the rendered subset, if filtered)
     const edgeCounts = new Map<string, number>();
@@ -193,23 +256,33 @@ export function SigmaCanvas({
         atomCluster.set(atomId, i);
       }
     }
+    if (islandLayout) {
+      for (const island of islandLayout.islands) {
+        for (const atomId of island.atomIds) atomCluster.set(atomId, island.index);
+      }
+    }
 
     // Add atom nodes at center — will animate to PCA positions
     const targetPositions: Record<string, { x: number; y: number }> = {};
     for (const atom of atoms) {
       const connectivity = (edgeCounts.get(atom.atom_id) || 0) / maxEdges;
       const clusterIdx = atomCluster.get(atom.atom_id);
-      targetPositions[atom.atom_id] = { x: atom.x * scale, y: atom.y * scale };
+      const tagCategory = categoryForAtom(atom.tag_ids, tagCategoryIndexRef.current);
+      const islandPosition = islandLayout?.positions.get(atom.atom_id);
+      targetPositions[atom.atom_id] = islandPosition ?? { x: atom.x * scale, y: atom.y * scale };
       graph.addNode(atom.atom_id, {
         x: 0,
         y: 0,
         size: 2.5 + connectivity * 5,
-        color: nodeColor(theme, connectivity, clusterIdx),
+        color: colorModeRef.current === 'category'
+          ? categoryColor(tagCategory)
+          : nodeColor(theme, connectivity, clusterIdx),
         label: truncLabel(atom.title || atom.atom_id.substring(0, 8), 30),
         fullLabel: atom.title || atom.atom_id.substring(0, 8),
         connectivity,
         clusterIndex: clusterIdx,
         tagIds: atom.tag_ids,
+        tagCategory,
       });
     }
 
@@ -236,6 +309,16 @@ export function SigmaCanvas({
       neighbors.get(edge.target)!.add(edge.source);
     }
     neighborsRef.current = neighbors;
+
+    // Semantic islands live on a lightweight 2D underlay. Sigma remains the
+    // only WebGL renderer; the underlay simply gives each community a quiet,
+    // readable territory behind its atoms and edges.
+    const islandCanvas = document.createElement('canvas');
+    islandCanvas.style.position = 'absolute';
+    islandCanvas.style.inset = '0';
+    islandCanvas.style.pointerEvents = 'none';
+    islandCanvas.style.zIndex = '0';
+    if (visibleIslands.length > 1) container.appendChild(islandCanvas);
 
     const sigma = new Sigma(graph, container, {
       // Atom labels are drawn manually on the overlay canvas (drawLabels) with
@@ -288,6 +371,7 @@ export function SigmaCanvas({
         const tagIds = (attrs as any).tagIds as string[] | undefined;
         const matches = tagIds?.includes(tagId);
         if (matches) return attrs;
+        if (isolateSelectedTagRef.current) return { ...attrs, hidden: true };
         return {
           ...attrs,
           color: 'rgba(50, 50, 50, 0.3)',
@@ -301,6 +385,17 @@ export function SigmaCanvas({
         const pinned = pinnedNodeRef.current;
         const t = themeRef.current;
         const anim = edgeAnimProgress.current;
+        const tagId = selectedTagRef.current;
+        if (tagId && isolateSelectedTagRef.current) {
+          const g = graphRef.current!;
+          const src = g.source(edge);
+          const dst = g.target(edge);
+          const sourceTags = g.getNodeAttribute(src, 'tagIds') as string[] | undefined;
+          const targetTags = g.getNodeAttribute(dst, 'tagIds') as string[] | undefined;
+          if (!sourceTags?.includes(tagId) || !targetTags?.includes(tagId)) {
+            return { ...attrs, hidden: true };
+          }
+        }
         if (hovered || pinned) {
           const g = graphRef.current!;
           const src = g.source(edge);
@@ -349,6 +444,57 @@ export function SigmaCanvas({
     });
 
     sigmaRef.current = sigma;
+
+    function drawIslandUnderlay() {
+      if (visibleIslands.length <= 1 || !islandCanvas.isConnected) return;
+      const width = container!.clientWidth;
+      const height = container!.clientHeight;
+      const ratio = window.devicePixelRatio || 1;
+      islandCanvas.width = width * ratio;
+      islandCanvas.height = height * ratio;
+      islandCanvas.style.width = `${width}px`;
+      islandCanvas.style.height = `${height}px`;
+      const ctx = islandCanvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      for (const island of visibleIslands) {
+        const memberPositions = island.atomIds
+          .filter(id => graph.hasNode(id))
+          .map(id => {
+            const attrs = graph.getNodeAttributes(id);
+            return sigma.graphToViewport({ x: attrs.x as number, y: attrs.y as number });
+          });
+        if (memberPositions.length === 0) continue;
+        const center = memberPositions.reduce(
+          (acc, position) => ({ x: acc.x + position.x, y: acc.y + position.y }),
+          { x: 0, y: 0 },
+        );
+        center.x /= memberPositions.length;
+        center.y /= memberPositions.length;
+        const radius = Math.max(
+          48,
+          ...memberPositions.map(position => Math.hypot(position.x - center.x, position.y - center.y) + 34),
+        );
+        const base = themeRef.current.palette[island.index % themeRef.current.palette.length] ?? [100, 110, 140];
+        ctx.beginPath();
+        ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${base[0]}, ${base[1]}, ${base[2]}, 0.075)`;
+        ctx.fill();
+        ctx.strokeStyle = `rgba(${base[0]}, ${base[1]}, ${base[2]}, 0.35)`;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 7]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (island.isUnclustered) {
+          ctx.fillStyle = 'rgba(210, 220, 235, 0.6)';
+          ctx.font = '600 10px system-ui, -apple-system, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('UNCLUSTERED', center.x, center.y - radius - 10);
+        }
+      }
+    }
 
     // Cluster labels canvas
     const labelCanvas = document.createElement('canvas');
@@ -596,7 +742,9 @@ export function SigmaCanvas({
       }
     }
 
+    sigma.on('afterRender', drawIslandUnderlay);
     sigma.on('afterRender', drawLabels);
+    requestAnimationFrame(drawIslandUnderlay);
     requestAnimationFrame(drawLabels);
 
     // Lock the bounding box to the final layout so Sigma doesn't
@@ -817,13 +965,15 @@ export function SigmaCanvas({
         store.unregisterController();
       }
       sigma.kill();
+      islandCanvas.remove();
       labelCanvas.remove();
       sigmaRef.current = null;
       graphRef.current = null;
     };
-  }, [data, isPreview, filterKey]); // intentionally exclude theme — handled below
+  }, [data, isPreview, filterKey, layoutMode, focusedClusterId, showClusterBridges]); // theme and colours update in place below
 
-  // Update colors when theme changes (without recreating graph)
+  // Update visual encoding in place — category colours distinguish the tag
+  // taxonomy, while cluster colours remain available for semantic comparison.
   useEffect(() => {
     const graph = graphRef.current;
     const sigma = sigmaRef.current;
@@ -834,18 +984,27 @@ export function SigmaCanvas({
     // Update node colors
     graph.forEachNode((node, attrs) => {
       const connectivity = (edgeCounts.get(node) || 0) / maxEdges;
-      graph.setNodeAttribute(node, 'color', nodeColor(theme, connectivity, (attrs as any).clusterIndex));
+      const tagIds = ((attrs as any).tagIds as string[] | undefined) ?? [];
+      const tagCategory = categoryForAtom(tagIds, tagCategoryIndex);
+      graph.setNodeAttribute(node, 'tagCategory', tagCategory);
+      graph.setNodeAttribute(
+        node,
+        'color',
+        colorMode === 'category'
+          ? categoryColor(tagCategory)
+          : nodeColor(theme, connectivity, (attrs as any).clusterIndex),
+      );
     });
 
     // Atom label color comes from themeRef inside drawLabels — just trigger a refresh.
     // Edges update via edgeReducer (also reads themeRef.current).
     sigma.refresh();
-  }, [theme]);
+  }, [theme, colorMode, tagCategoryIndex]);
 
   // Refresh when selected tag changes (nodeReducer reads selectedTagRef)
   useEffect(() => {
     sigmaRef.current?.refresh();
-  }, [selectedTagId]);
+  }, [selectedTagId, isolateSelectedTag]);
 
   // Continuously refresh sigma during chat sidebar transition so the graph
   // resizes smoothly. Expanding the pane collapses this column to zero width
@@ -974,6 +1133,109 @@ export function SigmaCanvas({
             className="absolute inset-0 z-20 cursor-pointer bg-transparent hover:bg-white/[0.03] transition-colors"
             aria-label="Open canvas view"
           />
+        )}
+
+        {/* The control deck deliberately explains the graph's two independent
+            dimensions: islands show semantic communities; colour shows tags
+            or communities. It stays compact so the canvas remains the work. */}
+        {!isPreview && !isLoading && data && data.atoms.length > 0 && (
+          <div className="absolute top-4 left-4 z-20 max-w-[min(28rem,calc(100%-2rem))] rounded-lg border border-white/10 bg-[#16161a]/90 px-2.5 py-2 shadow-2xl backdrop-blur-sm">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-white/40">Layout</span>
+              <button
+                type="button"
+                onClick={() => {
+                  localStorage.setItem('canvas-layout-mode', 'islands');
+                  setLayoutMode('islands');
+                }}
+                className={`rounded px-2 py-1 text-[11px] transition-colors ${layoutMode === 'islands' ? 'bg-white/14 text-white' : 'text-white/45 hover:bg-white/8 hover:text-white/75'}`}
+              >
+                Islands
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  localStorage.setItem('canvas-layout-mode', 'map');
+                  setLayoutMode('map');
+                }}
+                className={`rounded px-2 py-1 text-[11px] transition-colors ${layoutMode === 'map' ? 'bg-white/14 text-white' : 'text-white/45 hover:bg-white/8 hover:text-white/75'}`}
+              >
+                Semantic map
+              </button>
+              <span className="mx-1 h-4 w-px bg-white/10" />
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-white/40">Colour</span>
+              <button
+                type="button"
+                onClick={() => {
+                  localStorage.setItem('canvas-color-mode', 'category');
+                  setColorMode('category');
+                }}
+                className={`rounded px-2 py-1 text-[11px] transition-colors ${colorMode === 'category' ? 'bg-white/14 text-white' : 'text-white/45 hover:bg-white/8 hover:text-white/75'}`}
+              >
+                Tag category
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  localStorage.setItem('canvas-color-mode', 'cluster');
+                  setColorMode('cluster');
+                }}
+                className={`rounded px-2 py-1 text-[11px] transition-colors ${colorMode === 'cluster' ? 'bg-white/14 text-white' : 'text-white/45 hover:bg-white/8 hover:text-white/75'}`}
+              >
+                Cluster
+              </button>
+            </div>
+
+            <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-white/8 pt-2">
+              <label className="flex min-w-0 items-center gap-1.5 text-[10px] text-white/45">
+                <span className="uppercase tracking-[0.12em]">Focus</span>
+                <select
+                  value={focusedClusterId ?? ''}
+                  onChange={(event) => setFocusedClusterId(event.target.value || null)}
+                  className="max-w-48 rounded border border-white/10 bg-[#202027] px-1.5 py-1 text-[11px] text-white/75 outline-none hover:border-white/25"
+                >
+                  <option value="">All clusters</option>
+                  {data.clusters.map(cluster => (
+                    <option key={cluster.id} value={cluster.id}>
+                      {cluster.label} · {cluster.atom_count}
+                    </option>
+                  ))}
+                  {data.atoms.some(atom => !data.clusters.some(cluster => cluster.atom_ids.includes(atom.atom_id))) && (
+                    <option value="cluster:unclustered">Unclustered</option>
+                  )}
+                </select>
+              </label>
+              {layoutMode === 'islands' && (
+                <button
+                  type="button"
+                  onClick={() => setShowClusterBridges(value => !value)}
+                  className={`rounded border px-2 py-1 text-[10px] transition-colors ${showClusterBridges ? 'border-amber-300/35 bg-amber-300/12 text-amber-100' : 'border-white/10 text-white/50 hover:border-white/25 hover:text-white/75'}`}
+                >
+                  {showClusterBridges ? 'Bridges visible' : 'Show bridges'}
+                </button>
+              )}
+              {selectedTagId && (
+                <button
+                  type="button"
+                  onClick={() => setIsolateSelectedTag(value => !value)}
+                  className={`rounded border px-2 py-1 text-[10px] transition-colors ${isolateSelectedTag ? 'border-cyan-300/35 bg-cyan-300/12 text-cyan-100' : 'border-white/10 text-white/50 hover:border-white/25 hover:text-white/75'}`}
+                >
+                  {isolateSelectedTag ? 'Showing tag only' : 'Isolate selected tag'}
+                </button>
+              )}
+            </div>
+
+            {colorMode === 'category' && (
+              <div className="mt-2 flex flex-wrap gap-x-2.5 gap-y-1 border-t border-white/8 pt-2 text-[9px] text-white/42">
+                {Object.entries({ Topics: 'Topics', People: 'People', Locations: 'Locations', Organizations: 'Organizations', Events: 'Events' }).map(([category, label]) => (
+                  <span key={category} className="flex items-center gap-1">
+                    <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: categoryColor(category) }} />
+                    {label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {/* Theme picker + edge slider — main view only */}
