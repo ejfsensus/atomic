@@ -193,3 +193,21 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8081/health || exit 1
 
 CMD ["sh", "-c", "exec supervisord -c /etc/supervisor/conf.d/supervisord.conf"]
+
+# =============================================================================
+# Stage 8: Railway — single service, persistent SQLite data
+# =============================================================================
+# Railway builds the final Dockerfile stage and injects PORT at runtime. This
+# stage layers its runtime-port-aware nginx configuration over the regular
+# all-in-one SQLite image, keeping the established server and web build paths
+# unchanged for Docker Compose and Fly.io.
+FROM all-in-one AS railway
+
+RUN rm -f /etc/nginx/conf.d/atomic.conf && mkdir -p /etc/nginx/templates
+COPY docker/nginx-railway.conf.template /etc/nginx/templates/atomic.conf.template
+COPY docker/railway-entrypoint.sh /usr/local/bin/railway-entrypoint
+RUN chmod 755 /usr/local/bin/railway-entrypoint
+
+# Railway supplies PORT. The entrypoint defaults to 8080 for local validation.
+EXPOSE 8080
+CMD ["/usr/local/bin/railway-entrypoint"]
