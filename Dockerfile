@@ -23,8 +23,8 @@ COPY .cargo/ .cargo/
 
 # Cook dependencies (cached until Cargo.toml/lock changes)
 COPY --from=planner /app/recipe.json recipe.json
-RUN --mount=type=cache,id=atomic-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=atomic-server-target,target=/app/target \
+RUN --mount=type=cache,id=s/b3ffc463-1e78-4229-9332-f1731c855117-/usr/local/cargo/registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=s/b3ffc463-1e78-4229-9332-f1731c855117-/app/target,target=/app/target \
     cargo chef cook --profile server --recipe-path recipe.json -p atomic-server
 
 # Copy real workspace source
@@ -39,8 +39,8 @@ RUN mkdir -p src-tauri/src && \
     echo "fn main() { tauri_build::build(); }" > src-tauri/build.rs
 
 # Build atomic-server with the faster server profile
-RUN --mount=type=cache,id=atomic-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=atomic-server-target,target=/app/target \
+RUN --mount=type=cache,id=s/b3ffc463-1e78-4229-9332-f1731c855117-/usr/local/cargo/registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=s/b3ffc463-1e78-4229-9332-f1731c855117-/app/target,target=/app/target \
     cargo build --profile server -p atomic-server && \
     cp /app/target/server/atomic-server /usr/local/bin/atomic-server
 
