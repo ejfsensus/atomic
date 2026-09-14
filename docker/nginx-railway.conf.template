@@ -1,11 +1,16 @@
 upstream atomic_server {
-    server 127.0.0.1:8080;
+    server 127.0.0.1:__ATOMIC_BACKEND_PORT__;
 }
 
 server {
     # Replaced by railway-entrypoint.sh with Railway's assigned PORT.
     listen __RAILWAY_PORT__;
     server_name _;
+
+    # Browsers can accumulate sizeable auth/session cookies. Railway reaches
+    # this nginx instance directly, so accept realistic application headers.
+    client_header_buffer_size 8k;
+    large_client_header_buffers 4 32k;
 
     root /usr/share/nginx/html;
     index index.html;
