@@ -10,6 +10,29 @@ let localServerConfig: HttpTransportConfig | null = null;
 export const TRANSPORT_CHANGED_EVENT = 'atomic:transport-changed';
 export const TRANSPORT_CONNECTION_EVENT = 'atomic:transport-connection';
 
+/**
+ * Railway exposes a container port through the domain itself, not through a
+ * path suffix. Correct accidental same-origin values such as
+ * https://example.up.railway.app/8080, which would otherwise send API POSTs
+ * to nginx's SPA fallback and produce a misleading 405 response.
+ */
+function normalizeTransportConfig(config: HttpTransportConfig): HttpTransportConfig {
+  let baseUrl = config.baseUrl.trim().replace(/\/+$/, '');
+
+  if (typeof window !== 'undefined' && baseUrl) {
+    try {
+      const parsed = new URL(baseUrl);
+      if (parsed.origin === window.location.origin && /^\/\d+$/.test(parsed.pathname)) {
+        baseUrl = parsed.origin;
+      }
+    } catch {
+      // Leave validation and connection errors to HttpTransport.
+    }
+  }
+
+  return baseUrl === config.baseUrl ? config : { ...config, baseUrl };
+}
+
 function dispatchTransportChanged(): void {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent(TRANSPORT_CHANGED_EVENT));
@@ -107,7 +130,11 @@ export async function initTransport(): Promise<void> {
 
     // Check if user has saved a remote server config
     const saved = localStorage.getItem('atomic-server-config');
-    const config = saved ? JSON.parse(saved) as HttpTransportConfig : localServerConfig;
+    const storedConfig = saved ? JSON.parse(saved) as HttpTransportConfig : localServerConfig;
+    const config = normalizeTransportConfig(storedConfig);
+    if (saved && config.baseUrl !== storedConfig.baseUrl) {
+      localStorage.setItem('atomic-server-config', JSON.stringify(config));
+    }
 
     activeTransport = new HttpTransport(config);
     wireConnectionCallback(activeTransport);
@@ -116,7 +143,11 @@ export async function initTransport(): Promise<void> {
     // Web SPA — require explicit config from localStorage or prompt user
     const saved = localStorage.getItem('atomic-server-config');
     if (saved) {
-      const config: HttpTransportConfig = JSON.parse(saved);
+      const storedConfig: HttpTransportConfig = JSON.parse(saved);
+      const config = normalizeTransportConfig(storedConfig);
+      if (config.baseUrl !== storedConfig.baseUrl) {
+        localStorage.setItem('atomic-server-config', JSON.stringify(config));
+      }
       activeTransport = new HttpTransport(config);
       wireConnectionCallback(activeTransport);
       connectInBackground(activeTransport);
@@ -130,12 +161,16 @@ export async function initTransport(): Promise<void> {
 
 /// Switch to a remote server (saves config to localStorage)
 export async function switchTransport(config: HttpTransportConfig): Promise<void> {
+  const normalizedConfig = normalizeTransportConfig(config);
   if (activeTransport) activeTransport.disconnect();
-  activeTransport = new HttpTransport(config);
+  activeTransport = new HttpTransport(normalizedConfig);
   wireConnectionCallback(activeTransport);
   await activeTransport.connect();
-  localStorage.setItem('atomic-server-config', JSON.stringify(config));
-  void syncSharedConfig({ serverURL: config.baseUrl, apiToken: config.authToken });
+  localStorage.setItem('atomic-server-config', JSON.stringify(normalizedConfig));
+  void syncSharedConfig({
+    serverURL: normalizedConfig.baseUrl,
+    apiToken: normalizedConfig.authToken,
+  });
   dispatchTransportChanged();
 }
 
